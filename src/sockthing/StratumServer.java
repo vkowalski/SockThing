@@ -15,6 +15,8 @@ import org.json.JSONObject;
 import com.google.bitcoin.core.NetworkParameters;
 import com.google.bitcoin.core.Address;
 import com.google.bitcoin.core.Block;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 public class StratumServer
 {
@@ -32,6 +34,7 @@ public class StratumServer
     private OutputMonster output_monster;
     private MetricsReporter metrics_reporter;
     private WittyRemarks witty_remarks;
+    private PPLNSAgent pplns_agent;
 
     private String instance_id;
 
@@ -42,10 +45,14 @@ public class StratumServer
     private volatile int current_block;
     private volatile long current_block_update_time;
 
+    private Semaphore new_block_notify_object;
+
     private StratumServer server;
 
     public StratumServer(Config config)
     {
+        new_block_notify_object = new Semaphore(0);
+
         this.config = config;
 
         config.require("port");
@@ -75,6 +82,7 @@ public class StratumServer
             witty_remarks.start();
         }
 
+        //pplns_agent.start();
 
 
     }
@@ -136,6 +144,15 @@ public class StratumServer
     public WittyRemarks getWittyRemarks()
     {
         return witty_remarks;
+    }
+
+    public void setPPLNSAgent(PPLNSAgent pplns_agent)
+    {
+        this.pplns_agent = pplns_agent;
+    }
+    public PPLNSAgent getPPLNSAgent()
+    {
+        return pplns_agent;
     }
 
     public NetworkParameters getNetworkParameters(){return network_params;}
@@ -351,7 +368,10 @@ public class StratumServer
                         System.out.println("MAX_TIME_WITHOUT_SUCCESS EXCEEDED.  Giving up.  Failure.");
                         System.exit(-1);
                     }
-                    Thread.sleep(1000);
+                    if (new_block_notify_object.tryAcquire(1, 1000, TimeUnit.MILLISECONDS))
+                    {
+                        System.out.println("New block notify");
+                    }
                     doRun();
 
                 }
@@ -395,6 +415,11 @@ public class StratumServer
 
 
         }
+    }
+
+    public void notifyNewBlock()
+    {
+        new_block_notify_object.release(1);
     }
 
     private void triggerUpdate(boolean clean)
@@ -482,7 +507,9 @@ public class StratumServer
         {
             server.setWittyRemarks(new WittyRemarks());
         }
-        
+        //server.setPPLNSAgent(new PPLNSAgent(server));
+
+        new NotifyListenerUDP(server).start();        
         server.start();
     }
 
@@ -504,15 +531,45 @@ public class StratumServer
 
     }
 
+    public double getDifficulty()
+        throws java.io.IOException, org.json.JSONException
+    {
+        JSONObject post;
+        post = new JSONObject(bitcoin_rpc.getSimplePostRequest("getdifficulty"));
+        return bitcoin_rpc.sendPost(post).getDouble("result");
+    }
+
     public String submitBlock(Block blk)
+    {
+        String result="N";
+        for(int i=0; i<10; i++)
+        {
+            System.out.println("Attempting block submit");
+            result = submitBlockAttempt(blk);
+            if(result.equals("Y")) return result;
+        }
+        return result;
+    }
+
+
+    private String submitBlockAttempt(Block blk)
     {
         try
         {
             JSONObject result = bitcoin_rpc.submitBlock(blk);
 
-            System.out.println(result.toString(2));
+            System.out.println("Block result: " + result.toString(2));
 
-            return "Y"; //TODO - actually check this
+            if (result.isNull("error") && result.isNull("result"))
+            {
+                return "Y"; 
+            }
+            else
+            {
+                System.out.println("Block submit error:  "+ result.get("error"));
+                return "N";
+            }
+
         }
         catch(Throwable t)
         {
